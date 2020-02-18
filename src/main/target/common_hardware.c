@@ -63,6 +63,10 @@
         #endif
     #endif
 
+    #if defined(USE_GYRO_ICM20689)
+        BUSDEV_REGISTER_SPI(busdev_icm20689,    DEVHW_ICM20689,     ICM20689_SPI_BUS,   ICM20689_CS_PIN,    GYRO_INT_EXTI,  DEVFLAGS_NONE);
+    #endif
+
     #if defined(USE_GYRO_BMI160)
         #if defined(BMI160_SPI_BUS)
         BUSDEV_REGISTER_SPI(busdev_bmi160,      DEVHW_BMI160,       BMI160_SPI_BUS,     BMI160_CS_PIN,      GYRO_INT_EXTI,  DEVFLAGS_NONE);
@@ -90,6 +94,28 @@
         #define BMP280_I2C_BUS BARO_I2C_BUS
     #endif
     BUSDEV_REGISTER_I2C(busdev_bmp280,      DEVHW_BMP280,       BMP280_I2C_BUS,     0x76,               NONE,           DEVFLAGS_NONE);
+    #endif
+#endif
+
+#if defined(USE_BARO_BMP388)
+    #if defined(BMP388_SPI_BUS)
+    BUSDEV_REGISTER_SPI(busdev_bmp388,      DEVHW_BMP388,       BMP388_SPI_BUS,     BMP388_CS_PIN,      NONE,           DEVFLAGS_NONE);
+    #elif defined(BMP388_I2C_BUS) || defined(BARO_I2C_BUS)
+    #if !defined(BMP388_I2C_BUS)
+        #define BMP388_I2C_BUS BARO_I2C_BUS
+    #endif
+    BUSDEV_REGISTER_I2C(busdev_bmp388,      DEVHW_BMP388,       BMP388_I2C_BUS,     0x76,               NONE,           DEVFLAGS_NONE);
+    #endif
+#endif
+
+#if defined(USE_BARO_SPL06)
+    #if defined(SPL06_SPI_BUS)
+      BUSDEV_REGISTER_SPI(busdev_spl06,     DEVHW_SPL06,        SPL06_SPI_BUS,      SPL06_CS_PIN,       NONE,           DEVFLAGS_NONE);
+    #elif defined(SPL06_I2C_BUS) || defined(BARO_I2C_BUS)
+      #if !defined(SPL06_I2C_BUS)
+        #define SPL06_I2C_BUS BARO_I2C_BUS
+      #endif
+      BUSDEV_REGISTER_I2C(busdev_spl06,     DEVHW_SPL06,        SPL06_I2C_BUS,      0x76,               NONE,           DEVFLAGS_NONE);
     #endif
 #endif
 
@@ -159,7 +185,7 @@
     #if !defined(MAG3110_I2C_BUS)
         #define MAG3110_I2C_BUS MAG_I2C_BUS
     #endif
-    BUSDEV_REGISTER_I2C(busdev_mag3110,     DEVHW_MAG3110,      MAG3110_I2C_BUS,    0x0C,               NONE,           DEVFLAGS_NONE);
+    BUSDEV_REGISTER_I2C(busdev_mag3110,     DEVHW_MAG3110,      MAG3110_I2C_BUS,    0x0E,               NONE,           DEVFLAGS_NONE);
 #endif
 
 #if defined(USE_MAG_LIS3MDL)
@@ -175,7 +201,8 @@
     #if !defined(IST8310_I2C_BUS)
         #define IST8310_I2C_BUS MAG_I2C_BUS
     #endif
-    BUSDEV_REGISTER_I2C(busdev_ist8310,     DEVHW_IST8310,      IST8310_I2C_BUS,    0x0E,               NONE,           DEVFLAGS_NONE);
+    BUSDEV_REGISTER_I2C(busdev_ist8310_0,   DEVHW_IST8310_0,    IST8310_I2C_BUS,    0x0C,               NONE,           DEVFLAGS_NONE);
+    BUSDEV_REGISTER_I2C(busdev_ist8310_1,   DEVHW_IST8310_1,    IST8310_I2C_BUS,    0x0E,               NONE,           DEVFLAGS_NONE);
 #endif
 
 #if defined(USE_MAG_IST8308)
@@ -231,7 +258,7 @@
     #endif
 #endif
 
-#if defined(USE_RANGEFINDER_HCSR04_I2C)
+#if defined(USE_RANGEFINDER_HCSR04_I2C) && (defined(HCSR04_I2C_BUS) || defined(RANGEFINDER_I2C_BUS))
     #if !defined(HCSR04_I2C_BUS)
         #define HCSR04_I2C_BUS RANGEFINDER_I2C_BUS
     #endif
@@ -276,9 +303,12 @@
     BUSDEV_REGISTER_SPI(busdev_sdcard_spi,  DEVHW_SDCARD,       SDCARD_SPI_BUS,     SDCARD_CS_PIN,      NONE,           DEVFLAGS_USE_MANUAL_DEVICE_SELECT | DEVFLAGS_SPI_MODE_0);
 #endif
 
+/*
+// FIXME(digitalentity): This is unnecessary at the moment as SDIO is not part of BusDevice infrastructure
 #if defined(USE_SDCARD) && defined(USE_SDCARD_SDIO)
     BUSDEV_REGISTER_SDIO(busdev_sdcard_sdio,DEVHW_SDCARD,       SDCARD_SDIO_BUS,    SDCARD_CS_PIN,      NONE,           DEVFLAGS_USE_MANUAL_DEVICE_SELECT);
 #endif
+*/
 
 #if defined(USE_OLED_UG2864)
     #if !defined(UG2864_I2C_BUS)

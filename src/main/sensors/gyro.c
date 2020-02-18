@@ -26,13 +26,15 @@
 #include "build/debug.h"
 
 #include "common/axis.h"
-#include "common/maths.h"
 #include "common/calibration.h"
 #include "common/filter.h"
+#include "common/log.h"
+#include "common/maths.h"
 #include "common/utils.h"
 
 #include "config/parameter_group.h"
 #include "config/parameter_group_ids.h"
+#include "config/feature.h"
 
 #include "drivers/accgyro/accgyro.h"
 #include "drivers/accgyro/accgyro_mpu.h"
@@ -52,7 +54,6 @@
 #include "drivers/accgyro/accgyro_icm20689.h"
 #include "drivers/accgyro/accgyro_fake.h"
 #include "drivers/io.h"
-#include "drivers/logging.h"
 
 #include "fc/config.h"
 #include "fc/runtime_config.h"
@@ -66,6 +67,9 @@
 #include "sensors/gyro.h"
 #include "sensors/sensors.h"
 
+#include "flight/gyroanalyse.h"
+#include "flight/rpm_filter.h"
+
 #ifdef USE_HARDWARE_REVISION_DETECTION
 #include "hardware_revision.h"
 #endif
@@ -78,29 +82,35 @@ STATIC_FASTRAM int16_t gyroTemperature0;
 STATIC_FASTRAM_UNIT_TESTED zeroCalibrationVector_t gyroCalibration;
 STATIC_FASTRAM int32_t gyroADC[XYZ_AXIS_COUNT];
 
-STATIC_FASTRAM filterApplyFnPtr softLpfFilterApplyFn;
-STATIC_FASTRAM void *softLpfFilter[XYZ_AXIS_COUNT];
+STATIC_FASTRAM filterApplyFnPtr gyroLpfApplyFn;
+STATIC_FASTRAM filter_t gyroLpfState[XYZ_AXIS_COUNT];
 
-#ifdef USE_GYRO_NOTCH_1
+STATIC_FASTRAM filterApplyFnPtr gyroLpf2ApplyFn;
+STATIC_FASTRAM filter_t gyroLpf2State[XYZ_AXIS_COUNT];
+
 STATIC_FASTRAM filterApplyFnPtr notchFilter1ApplyFn;
 STATIC_FASTRAM void *notchFilter1[XYZ_AXIS_COUNT];
-#endif
-#ifdef USE_GYRO_NOTCH_2
 STATIC_FASTRAM filterApplyFnPtr notchFilter2ApplyFn;
 STATIC_FASTRAM void *notchFilter2[XYZ_AXIS_COUNT];
+
+#ifdef USE_DYNAMIC_FILTERS
+
+#define DYNAMIC_NOTCH_DEFAULT_CENTER_HZ 350
+#define DYNAMIC_NOTCH_DEFAULT_CUTOFF_HZ 300
+
+static EXTENDED_FASTRAM filterApplyFnPtr notchFilterDynApplyFn;
+static EXTENDED_FASTRAM filterApplyFnPtr notchFilterDynApplyFn2;
+static EXTENDED_FASTRAM biquadFilter_t notchFilterDyn[XYZ_AXIS_COUNT];
+static EXTENDED_FASTRAM biquadFilter_t notchFilterDyn2[XYZ_AXIS_COUNT];
+EXTENDED_FASTRAM gyroAnalyseState_t gyroAnalyseState;
 #endif
 
-#if defined(USE_GYRO_BIQUAD_RC_FIR2)
-// gyro biquad RC FIR2 filter
-STATIC_FASTRAM filterApplyFnPtr gyroFilterStage2ApplyFn;
-STATIC_FASTRAM void *stage2Filter[XYZ_AXIS_COUNT];
-#endif
-
-PG_REGISTER_WITH_RESET_TEMPLATE(gyroConfig_t, gyroConfig, PG_GYRO_CONFIG, 4);
+PG_REGISTER_WITH_RESET_TEMPLATE(gyroConfig_t, gyroConfig, PG_GYRO_CONFIG, 7);
 
 PG_RESET_TEMPLATE(gyroConfig_t, gyroConfig,
     .gyro_lpf = GYRO_LPF_42HZ,      // 42HZ value is defined for Invensense/TDK gyros
     .gyro_soft_lpf_hz = 60,
+    .gyro_soft_lpf_type = FILTER_BIQUAD,
     .gyro_align = ALIGN_DEFAULT,
     .gyroMovementCalibrationThreshold = 32,
     .looptime = 1000,
@@ -110,7 +120,12 @@ PG_RESET_TEMPLATE(gyroConfig_t, gyroConfig,
     .gyro_soft_notch_cutoff_1 = 1,
     .gyro_soft_notch_hz_2 = 0,
     .gyro_soft_notch_cutoff_2 = 1,
-    .gyro_stage2_lowpass_hz = 0
+    .gyro_stage2_lowpass_hz = 0,
+    .gyro_stage2_lowpass_type = FILTER_BIQUAD,
+    .dyn_notch_width_percent = 8,
+    .dyn_notch_range = DYN_NOTCH_RANGE_MEDIUM,
+    .dyn_notch_q = 120,
+    .dyn_notch_min_hz = 150,
 );
 
 STATIC_UNIT_TESTED gyroSensor_e gyroDetect(gyroDev_t *dev, gyroSensor_e gyroHardware)
@@ -243,14 +258,39 @@ STATIC_UNIT_TESTED gyroSensor_e gyroDetect(gyroDev_t *dev, gyroSensor_e gyroHard
         gyroHardware = GYRO_NONE;
     }
 
-    addBootlogEvent6(BOOT_EVENT_GYRO_DETECTION, BOOT_EVENT_FLAGS_NONE, gyroHardware, 0, 0, 0);
-
     if (gyroHardware != GYRO_NONE) {
         detectedSensors[SENSOR_INDEX_GYRO] = gyroHardware;
         sensorsSet(SENSOR_GYRO);
     }
     return gyroHardware;
 }
+
+#ifdef USE_DYNAMIC_FILTERS
+bool isDynamicFilterActive(void)
+{
+    return feature(FEATURE_DYNAMIC_FILTERS);
+}
+
+static void gyroInitFilterDynamicNotch(void)
+{
+
+    notchFilterDynApplyFn = nullFilterApply;
+    notchFilterDynApplyFn2 = nullFilterApply;
+
+    if (isDynamicFilterActive()) {
+        notchFilterDynApplyFn = (filterApplyFnPtr)biquadFilterApplyDF1; // must be this function, not DF2
+        if(gyroConfig()->dyn_notch_width_percent != 0) {
+            notchFilterDynApplyFn2 = (filterApplyFnPtr)biquadFilterApplyDF1; // must be this function, not DF2
+        }
+        const float notchQ = filterGetNotchQ(DYNAMIC_NOTCH_DEFAULT_CENTER_HZ, DYNAMIC_NOTCH_DEFAULT_CUTOFF_HZ); // any defaults OK here
+        for (int axis = 0; axis < XYZ_AXIS_COUNT; axis++) {
+            biquadFilterInit(&notchFilterDyn[axis], DYNAMIC_NOTCH_DEFAULT_CENTER_HZ, getLooptime(), notchQ, FILTER_NOTCH);
+            biquadFilterInit(&notchFilterDyn2[axis], DYNAMIC_NOTCH_DEFAULT_CENTER_HZ, getLooptime(), notchQ, FILTER_NOTCH);
+        }
+    }
+
+}
+#endif
 
 bool gyroInit(void)
 {
@@ -281,44 +321,46 @@ bool gyroInit(void)
     }
 
     gyroInitFilters();
+#ifdef USE_DYNAMIC_FILTERS
+    gyroInitFilterDynamicNotch();
+    gyroDataAnalyseStateInit(&gyroAnalyseState, getLooptime());
+#endif
     return true;
+}
+
+static void initGyroFilter(filterApplyFnPtr *applyFn, filter_t state[], uint8_t type, uint16_t cutoff)
+{
+    *applyFn = nullFilterApply;
+    if (cutoff > 0) {
+        switch (type) 
+        {
+            case FILTER_PT1:
+                *applyFn = (filterApplyFnPtr)pt1FilterApply;
+                for (int axis = 0; axis < 3; axis++) {
+                    pt1FilterInit(&state[axis].pt1, cutoff, getLooptime()* 1e-6f);
+                }
+                break;
+            case FILTER_BIQUAD:
+                *applyFn = (filterApplyFnPtr)biquadFilterApply;
+                for (int axis = 0; axis < 3; axis++) {
+                    biquadFilterInitLPF(&state[axis].biquad, cutoff, getLooptime());
+                }
+                break;
+        }
+    }
 }
 
 void gyroInitFilters(void)
 {
-    STATIC_FASTRAM biquadFilter_t gyroFilterLPF[XYZ_AXIS_COUNT];
-    softLpfFilterApplyFn = nullFilterApply;
-#ifdef USE_GYRO_NOTCH_1
     STATIC_FASTRAM biquadFilter_t gyroFilterNotch_1[XYZ_AXIS_COUNT];
     notchFilter1ApplyFn = nullFilterApply;
-#endif
-#ifdef USE_GYRO_NOTCH_2
+    
     STATIC_FASTRAM biquadFilter_t gyroFilterNotch_2[XYZ_AXIS_COUNT];
     notchFilter2ApplyFn = nullFilterApply;
-#endif
+    
+    initGyroFilter(&gyroLpf2ApplyFn, gyroLpf2State, gyroConfig()->gyro_stage2_lowpass_type, gyroConfig()->gyro_stage2_lowpass_hz);
+    initGyroFilter(&gyroLpfApplyFn, gyroLpfState, gyroConfig()->gyro_soft_lpf_type, gyroConfig()->gyro_soft_lpf_hz);
 
-#ifdef USE_GYRO_BIQUAD_RC_FIR2
-    STATIC_FASTRAM biquadFilter_t gyroFilterStage2[XYZ_AXIS_COUNT];
-    gyroFilterStage2ApplyFn = nullFilterApply;
-
-    if (gyroConfig()->gyro_stage2_lowpass_hz > 0) {
-        gyroFilterStage2ApplyFn = (filterApplyFnPtr)biquadFilterApply;
-        for (int axis = 0; axis < 3; axis++) {
-            stage2Filter[axis] = &gyroFilterStage2[axis];
-            biquadRCFIR2FilterInit(stage2Filter[axis], gyroConfig()->gyro_stage2_lowpass_hz, getLooptime());
-        }
-    }
-#endif
-
-    if (gyroConfig()->gyro_soft_lpf_hz) {
-        softLpfFilterApplyFn = (filterApplyFnPtr)biquadFilterApply;
-        for (int axis = 0; axis < 3; axis++) {
-            softLpfFilter[axis] = &gyroFilterLPF[axis];
-            biquadFilterInitLPF(softLpfFilter[axis], gyroConfig()->gyro_soft_lpf_hz, getLooptime());
-        }
-    }
-
-#ifdef USE_GYRO_NOTCH_1
     if (gyroConfig()->gyro_soft_notch_hz_1) {
         notchFilter1ApplyFn = (filterApplyFnPtr)biquadFilterApply;
         for (int axis = 0; axis < 3; axis++) {
@@ -326,9 +368,7 @@ void gyroInitFilters(void)
             biquadFilterInitNotch(notchFilter1[axis], getLooptime(), gyroConfig()->gyro_soft_notch_hz_1, gyroConfig()->gyro_soft_notch_cutoff_1);
         }
     }
-#endif
 
-#ifdef USE_GYRO_NOTCH_2
     if (gyroConfig()->gyro_soft_notch_hz_2) {
         notchFilter2ApplyFn = (filterApplyFnPtr)biquadFilterApply;
         for (int axis = 0; axis < 3; axis++) {
@@ -336,7 +376,6 @@ void gyroInitFilters(void)
             biquadFilterInitNotch(notchFilter2[axis], getLooptime(), gyroConfig()->gyro_soft_notch_hz_2, gyroConfig()->gyro_soft_notch_cutoff_2);
         }
     }
-#endif
 }
 
 void gyroStartCalibration(void)
@@ -344,7 +383,7 @@ void gyroStartCalibration(void)
     zeroCalibrationStartV(&gyroCalibration, CALIBRATING_GYRO_TIME_MS, gyroConfig()->gyroMovementCalibrationThreshold, false);
 }
 
-bool gyroIsCalibrationComplete(void)
+bool FAST_CODE NOINLINE gyroIsCalibrationComplete(void)
 {
     return zeroCalibrationIsCompleteV(&gyroCalibration) && zeroCalibrationIsSuccessfulV(&gyroCalibration);
 }
@@ -367,7 +406,7 @@ STATIC_UNIT_TESTED void performGyroCalibration(gyroDev_t *dev, zeroCalibrationVe
         dev->gyroZero[1] = v.v[1];
         dev->gyroZero[2] = v.v[2];
 
-        DEBUG_TRACE_SYNC("Gyro calibration complete (%d, %d, %d)", dev->gyroZero[0], dev->gyroZero[1], dev->gyroZero[2]);
+        LOG_D(GYRO, "Gyro calibration complete (%d, %d, %d)", dev->gyroZero[0], dev->gyroZero[1], dev->gyroZero[2]);
         schedulerResetTaskStatistics(TASK_SELF); // so calibration cycles do not pollute tasks statistics
     }
     else {
@@ -387,7 +426,7 @@ void gyroGetMeasuredRotationRate(fpVector3_t *measuredRotationRate)
     }
 }
 
-void gyroUpdate()
+void FAST_CODE NOINLINE gyroUpdate()
 {
     // range: +/- 8192; +/- 2000 deg/sec
     if (gyroDev0.readFn(&gyroDev0)) {
@@ -417,30 +456,33 @@ void gyroUpdate()
 
         DEBUG_SET(DEBUG_GYRO, axis, lrintf(gyroADCf));
 
-        if (axis < 2) {
-            DEBUG_SET(DEBUG_STAGE2, axis, lrintf(gyroADCf));
-        }
-
-#ifdef USE_GYRO_BIQUAD_RC_FIR2
-        gyroADCf = gyroFilterStage2ApplyFn(stage2Filter[axis], gyroADCf);
+#ifdef USE_RPM_FILTER
+        DEBUG_SET(DEBUG_RPM_FILTER, axis, gyroADCf);
+        gyroADCf = rpmFilterGyroApply(axis, gyroADCf);
+        DEBUG_SET(DEBUG_RPM_FILTER, axis + 3, gyroADCf);
 #endif
 
-        if (axis < 2) {
-            DEBUG_SET(DEBUG_STAGE2, axis + 2, lrintf(gyroADCf));
-        }
-
-        gyroADCf = softLpfFilterApplyFn(softLpfFilter[axis], gyroADCf);
-
-        DEBUG_SET(DEBUG_NOTCH, axis, lrintf(gyroADCf));
-
-#ifdef USE_GYRO_NOTCH_1
+        gyroADCf = gyroLpf2ApplyFn((filter_t *) &gyroLpf2State[axis], gyroADCf);
+        gyroADCf = gyroLpfApplyFn((filter_t *) &gyroLpfState[axis], gyroADCf);
         gyroADCf = notchFilter1ApplyFn(notchFilter1[axis], gyroADCf);
-#endif
-#ifdef USE_GYRO_NOTCH_2
         gyroADCf = notchFilter2ApplyFn(notchFilter2[axis], gyroADCf);
+
+#ifdef USE_DYNAMIC_FILTERS
+        if (isDynamicFilterActive()) {
+            gyroDataAnalysePush(&gyroAnalyseState, axis, gyroADCf);
+            gyroADCf = notchFilterDynApplyFn((filter_t *)&notchFilterDyn[axis], gyroADCf);
+            gyroADCf = notchFilterDynApplyFn2((filter_t *)&notchFilterDyn2[axis], gyroADCf);
+        }
 #endif
         gyro.gyroADCf[axis] = gyroADCf;
     }
+
+#ifdef USE_DYNAMIC_FILTERS
+    if (isDynamicFilterActive()) {
+        gyroDataAnalyse(&gyroAnalyseState, notchFilterDyn, notchFilterDyn2);
+    }
+#endif
+
 }
 
 bool gyroReadTemperature(void)

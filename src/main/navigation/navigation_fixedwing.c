@@ -432,6 +432,11 @@ int16_t applyFixedWingMinSpeedController(timeUs_t currentTimeUs)
     return throttleSpeedAdjustment;
 }
 
+int16_t fixedWingPitchToThrottleCorrection(int16_t pitch)
+{
+    return DECIDEGREES_TO_DEGREES(pitch) * navConfig()->fw.pitch_to_throttle;
+}
+
 void applyFixedWingPitchRollThrottleController(navigationFSMStateFlags_t navStateFlags, timeUs_t currentTimeUs)
 {
     int16_t minThrottleCorrection = navConfig()->fw.min_throttle - navConfig()->fw.cruise_throttle;
@@ -447,7 +452,7 @@ void applyFixedWingPitchRollThrottleController(navigationFSMStateFlags_t navStat
         // PITCH >0 dive, <0 climb
         int16_t pitchCorrection = constrain(posControl.rcAdjustment[PITCH], -DEGREES_TO_DECIDEGREES(navConfig()->fw.max_dive_angle), DEGREES_TO_DECIDEGREES(navConfig()->fw.max_climb_angle));
         rcCommand[PITCH] = -pidAngleToRcCommand(pitchCorrection, pidProfile()->max_angle_inclination[FD_PITCH]);
-        int16_t throttleCorrection = DECIDEGREES_TO_DEGREES(pitchCorrection) * navConfig()->fw.pitch_to_throttle;
+        int16_t throttleCorrection = fixedWingPitchToThrottleCorrection(pitchCorrection);
 
 #ifdef NAV_FIXED_WING_LANDING
         if (navStateFlags & NAV_CTL_LAND) {
@@ -479,7 +484,7 @@ void applyFixedWingPitchRollThrottleController(navigationFSMStateFlags_t navStat
             isAutoThrottleManuallyIncreased = false;
         }
 
-        rcCommand[THROTTLE] = constrain(correctedThrottleValue, motorConfig()->minthrottle, motorConfig()->maxthrottle);
+        rcCommand[THROTTLE] = constrain(correctedThrottleValue, getThrottleIdleValue(), motorConfig()->maxthrottle);
     }
 
 #ifdef NAV_FIXED_WING_LANDING
@@ -492,7 +497,7 @@ void applyFixedWingPitchRollThrottleController(navigationFSMStateFlags_t navStat
              ((posControl.flags.estAglStatus == EST_TRUSTED) && (posControl.actualState.agl.pos.z <= navConfig()->general.land_slowdown_minalt)) ) {
 
             // Set motor to min. throttle and stop it when MOTOR_STOP feature is enabled
-            rcCommand[THROTTLE] = motorConfig()->minthrottle;
+            rcCommand[THROTTLE] = getThrottleIdleValue();
             ENABLE_STATE(NAV_MOTOR_STOP_OR_IDLE);
 
             // Stabilize ROLL axis on 0 degrees banking regardless of loiter radius and position
